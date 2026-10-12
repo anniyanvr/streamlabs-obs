@@ -1,13 +1,12 @@
-import electron from 'electron';
 import { mutation, StatefulService, ViewHandler } from 'services/core/stateful-service';
 import { lazyModule } from 'util/lazy-module';
 import path from 'path';
 import fs from 'fs';
 import { Subject } from 'rxjs';
-import { WindowsService } from 'services/windows';
+import { IWindowOptions, WindowsService } from 'services/windows';
 import { Inject } from 'services/core/injector';
 import { EApiPermissions } from './api/modules/module';
-import { VideoService } from 'services/video';
+import { VideoSettingsService } from 'services/settings-v2/video';
 import { DevServer } from './dev-server';
 import { HostsService } from 'services/hosts';
 import { authorizedHeaders, handleResponse, jfetch } from 'util/requests';
@@ -15,8 +14,11 @@ import { UserService } from 'services/user';
 import trim from 'lodash/trim';
 import without from 'lodash/without';
 import { PlatformContainerManager, getPageUrl, getAssetUrl } from './container-manager';
+import { stringifyAppSourceSettings } from './source-url';
 import { NavigationService } from 'services/navigation';
 import { InitAfter } from '../core';
+import * as remote from '@electron/remote';
+import { NavMenuService } from 'app-services';
 
 const DEV_PORT = 8081;
 
@@ -70,6 +72,11 @@ export enum EAppPageSlot {
    * The background slot is never mounted anywhere
    */
   Background = 'background',
+
+  /**
+   * Auxillary slot for functionality handled in a different window
+   */
+  PopOut = 'pop_out',
 }
 
 interface IAppPage {
@@ -105,6 +112,7 @@ interface IProductionAppResponse {
   is_beta: boolean;
   manifest: IAppManifest;
   name: string;
+  delisted?: boolean;
   screenshots: string[];
   version: string;
 }
@@ -120,7 +128,15 @@ export interface ILoadedApp {
   appUrl?: string;
   devPort?: number;
   enabled: boolean;
+  delisted?: boolean;
   icon?: string;
+
+  /**
+   * This should be for specific internal allow-listed apps which
+   * are given special permission to break the normal security
+   * sandboxing rules of the app store runtime.
+   */
+  highlyPrivileged: boolean;
 }
 
 interface IPlatformAppServiceState {
@@ -149,15 +165,35 @@ class PlatformAppsViews extends ViewHandler<IPlatformAppServiceState> {
   get enabledApps() {
     return this.state.loadedApps.filter(app => app.enabled);
   }
+
+  get productionApps() {
+    return this.state.loadedApps.filter(app => !app.unpacked);
+  }
+
+  getDelisted(appId: string) {
+    return this.getApp(appId)?.delisted ?? false;
+  }
+
+  isAppHighlyPrivileged(appId: string) {
+    // WARNING: Only internal Streamlabs apps should have these permissions
+    return [
+      'b472396e49', // Avatar - Beta / Ava
+      '04f85c93be', // Avatar - Cale Dev
+      '875cf5de20', // Coach - Ava
+      '93125d1c33', // Avatar Prod / Marcin
+      '9ef3e51301', // Avatar - Marcin Dev
+    ].includes(appId);
+  }
 }
 
-@InitAfter('UserService')
+@InitAfter('TcpServerService')
 export class PlatformAppsService extends StatefulService<IPlatformAppServiceState> {
   @Inject() windowsService: WindowsService;
-  @Inject() videoService: VideoService;
+  @Inject() videoSettingsService: VideoSettingsService;
   @Inject() hostsService: HostsService;
   @Inject() userService: UserService;
   @Inject() navigationService: NavigationService;
+  @Inject() navMenuService: NavMenuService;
 
   get views() {
     return new PlatformAppsViews(this.state);
@@ -171,6 +207,7 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
 
   appLoad = new Subject<ILoadedApp>();
   appUnload = new Subject<string>();
+  allAppsLoaded = new Subject<ILoadedApp[]>();
 
   /**
    * Signals all listening app sources that the provided
@@ -186,6 +223,7 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
   private devServer: DevServer;
 
   init() {
+    console.log('PlatformAppsService initialized');
     this.userService.userLogin.subscribe(async () => {
       this.unloadAllApps();
       this.loadProductionApps();
@@ -198,6 +236,8 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
           this.loadUnpackedApp(data.appPath, data.appToken);
         }
       }
+
+      this.allAppsLoaded.next(this.state.loadedApps);
     });
 
     this.userService.userLogout.subscribe(() => {
@@ -231,7 +271,7 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
     const disabledApps = this.getDisabledAppsFromStorage();
 
     productionApps.forEach(app => {
-      if (app.is_beta && !app.manifest) return;
+      if (!app.manifest) return;
 
       const unpackedVersionLoaded = this.state.loadedApps.find(
         loadedApp => loadedApp.id === app.id_hash && loadedApp.unpacked,
@@ -246,9 +286,13 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
         appToken: app.app_token,
         poppedOutSlots: [],
         icon: app.icon,
+        delisted: app.delisted,
         enabled: !(unpackedVersionLoaded || disabledApps.includes(app.id_hash)),
+        highlyPrivileged: this.views.isAppHighlyPrivileged(app.id_hash),
       });
     });
+
+    this.navMenuService.pinNewApps();
   }
 
   fetchAppStoreVisibility(): Promise<boolean> {
@@ -261,6 +305,15 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
     return jfetch<{ is_app_store_visible: boolean }>(request)
       .then(json => json.is_app_store_visible)
       .catch(() => false);
+  }
+
+  /**
+   * Refresh production apps list
+   */
+
+  async refreshProductionApps() {
+    this.unloadAllApps();
+    this.loadProductionApps();
   }
 
   /**
@@ -286,6 +339,8 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
     try {
       await this.validateManifest(manifest, appPath);
     } catch (e: unknown) {
+      // TODO: index
+      // @ts-ignore
       return e['message'];
     }
 
@@ -313,6 +368,7 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
       devPort: DEV_PORT,
       poppedOutSlots: [],
       enabled: true,
+      highlyPrivileged: this.views.isAppHighlyPrivileged(id),
     });
   }
 
@@ -324,10 +380,32 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
     return this.state.loadedApps.filter(app => !app.unpacked);
   }
 
-  loadApp(app: ILoadedApp) {
-    const { id, appToken } = app;
+  loadApp(newApp: ILoadedApp) {
+    const { id, appToken } = newApp;
+
+    // Reloading an app (e.g. the App Store triggering `loadProductionApps`) must not
+    // forget slots that are still popped out, or the main window will try to mount
+    // the same container and steal it from the pop-out window.
+    const existingApp = this.state.loadedApps.find(
+      a => a.id === id && a.unpacked === newApp.unpacked,
+    );
+    const app: ILoadedApp = existingApp?.poppedOutSlots.length
+      ? { ...newApp, poppedOutSlots: [...existingApp.poppedOutSlots] }
+      : newApp;
+
+    // `loadProductionApps` re-runs on App Store activity. If a production app is
+    // unchanged, leave its running containers alone: re-registering destroys every
+    // container for the app, including ones mounted in pop-out windows.
+    const unchanged =
+      existingApp &&
+      !app.unpacked &&
+      existingApp.enabled === app.enabled &&
+      existingApp.appUrl === app.appUrl &&
+      existingApp.appToken === app.appToken;
 
     this.LOAD_APP(app);
+    if (unchanged) return;
+
     if (app.unpacked && app.appPath) {
       // store app in local storage
       localStorage.setItem(
@@ -480,6 +558,7 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
     }
 
     this.sourceRefresh.next(appId);
+    return '';
   }
 
   private getAppIdFromServer(appToken: string): Promise<string> {
@@ -516,7 +595,7 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
     });
   }
 
-  getPageUrlForSource(appId: string, appSourceId: string, settings = '') {
+  getPageUrlForSource(appId: string, appSourceId: string, settings: unknown = '') {
     const app = this.views.getApp(appId);
 
     if (!app) return null;
@@ -528,8 +607,10 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
 
     let url = getPageUrl(app, source.file);
 
-    if (settings) {
-      url = `${url}&settings=${encodeURIComponent(settings)}`;
+    const normalizedSettings = stringifyAppSourceSettings(settings);
+
+    if (normalizedSettings) {
+      url = `${url}&settings=${encodeURIComponent(normalizedSettings)}`;
     }
 
     url = `${url}&source=true`;
@@ -570,8 +651,8 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
       }
       if (source.initialSize.type === ESourceSizeType.Relative) {
         return {
-          width: source.initialSize.width * this.videoService.baseWidth,
-          height: source.initialSize.height * this.videoService.baseHeight,
+          width: source.initialSize.width * this.videoSettingsService.baseWidth,
+          height: source.initialSize.height * this.videoSettingsService.baseHeight,
         };
       }
     }
@@ -596,33 +677,50 @@ export class PlatformAppsService extends StatefulService<IPlatformAppServiceStat
     return this.state.loadedApps.filter(app => !app.unpacked);
   }
 
-  popOutAppPage(appId: string, pageSlot: EAppPageSlot) {
+  popOutAppPage(appId: string, pageSlot: EAppPageSlot, windowOptions?: Partial<IWindowOptions>) {
     const app = this.views.getApp(appId);
     if (!app || !app.enabled) return;
 
     const windowId = `${appId}-${pageSlot}`;
-    const mousePos = electron.remote.screen.getCursorScreenPoint();
 
-    // We use a generated window Id to prevent someobody popping out the
-    // same winow multiple times.
+    // `center` is handled here rather than forwarded, since Electron would
+    // otherwise center on the primary display and override the computed position.
+    const { center, ...restWindowOptions } = windowOptions ?? {};
+    const size = restWindowOptions.size ?? this.getPagePopOutSize(appId, pageSlot);
+
+    let position: { x: number; y: number };
+    if (center) {
+      const bounds = this.windowsService.windows.main.getBounds();
+      position = {
+        x: Math.floor(bounds.x + bounds.width / 2 - size.width / 2),
+        y: Math.floor(bounds.y + bounds.height / 2 - size.height / 2),
+      };
+    } else {
+      position = remote.screen.getCursorScreenPoint();
+    }
+
+    // We use a generated window Id to prevent somebody popping out the
+    // same window multiple times.
     this.windowsService.createOneOffWindow(
       {
         componentName: 'PlatformAppPopOut',
         queryParams: { appId, pageSlot },
         title: app.manifest.name,
-        size: this.getPagePopOutSize(appId, pageSlot),
-        x: mousePos.x,
-        y: mousePos.y,
+        size,
+        x: position.x,
+        y: position.y,
+        persistWebContents: true,
+        ...restWindowOptions,
       },
       windowId,
     );
 
     this.POP_OUT_SLOT(appId, pageSlot);
 
-    const sub = this.windowsService.windowDestroyed.subscribe(winId => {
+    const windowDestroyed = this.windowsService.windowDestroyed.subscribe(winId => {
       if (winId === windowId) {
         this.POP_IN_SLOT(appId, pageSlot);
-        sub.unsubscribe();
+        windowDestroyed.unsubscribe();
       }
     });
   }
